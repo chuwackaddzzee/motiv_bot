@@ -64,9 +64,43 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Начинаю синхронизацию постов из канала...")
+    count = 0
+    try:
+        async for message in context.bot.get_chat_history(chat_id=CHANNEL_ID):
+            save_message_id(message.message_id)
+            count += 1
+    except Exception as e:
+        # get_chat_history недоступен, используем forward перебором
+        pass
+
+    if count == 0:
+        # Альтернатива: перебираем ID вручную
+        await update.message.reply_text(
+            "⚠️ Автосинхронизация недоступна через Telegram Bot API.\n\n"
+            "Просто опубликуй любой новый пост в канале — бот его подхватит автоматически.\n"
+            "Или перешли (forward) посты из канала боту вручную командой /addpost."
+        )
+        return
+
+    await update.message.reply_text(f"✅ Синхронизировано {count} постов!")
+
+
+async def addpost(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Добавить пост вручную: переслать сообщение из канала боту и написать /addpost"""
+    if update.message.forward_from_chat and str(update.message.forward_from_chat.id) == CHANNEL_ID:
+        save_message_id(update.message.forward_from_message_id)
+        await update.message.reply_text(f"✅ Пост #{update.message.forward_from_message_id} добавлен!")
+    else:
+        await update.message.reply_text(
+            "Перешли сюда пост из своего канала, затем напиши /addpost.\n"
+            "Или просто публикуй новые посты — бот будет сохранять их автоматически."
+        )
+
+
 async def _forward_random(chat_id, bot):
-    """Форвардит случайный пост, удаляя битые ID."""
-    for _ in range(5):  # максимум 5 попыток
+    for _ in range(5):
         message_id = get_random_message_id()
         if not message_id:
             return None
@@ -100,6 +134,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("random", send_random_post))
+    app.add_handler(CommandHandler("addpost", addpost))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, handle_channel_post))
 
