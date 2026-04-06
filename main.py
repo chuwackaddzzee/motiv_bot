@@ -1,23 +1,23 @@
 import logging
-import random
-import sqlite3
 import os
-
+import psycopg2
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, filters, CommandHandler, ContextTypes, CallbackQueryHandler
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHANNEL_ID = os.environ["CHANNEL_ID"]
-DB_FILE = "messages.db"
+DATABASE_URL = os.environ["DATABASE_URL"]
 
-# --- Logging ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# --- DB Setup ---
+def get_conn():
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_conn()
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY)''')
     conn.commit()
@@ -25,15 +25,15 @@ def init_db():
 
 
 def save_message_id(message_id: int):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_conn()
     c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO messages (id) VALUES (?)", (message_id,))
+    c.execute("INSERT INTO messages (id) VALUES (%s) ON CONFLICT DO NOTHING", (message_id,))
     conn.commit()
     conn.close()
 
 
 def get_random_message_id() -> int | None:
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT id FROM messages ORDER BY RANDOM() LIMIT 1")
     row = c.fetchone()
@@ -41,7 +41,14 @@ def get_random_message_id() -> int | None:
     return row[0] if row else None
 
 
-# --- Handlers ---
+def delete_message_id(message_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("DELETE FROM messages WHERE id = %s", (message_id,))
+    conn.commit()
+    conn.close()
+
+
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.channel_post
     if message and str(message.chat.id) == CHANNEL_ID:
@@ -50,23 +57,31 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("⚡️Random Motivation⚡️", callback_data="get_random")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    keyboard = [[InlineKeyboardButton("⚡️Random Motivation⚡️", callback_data="get_random")]]
     await update.message.reply_text(
         "Добро пожаловать! Нажми кнопку ниже, чтобы получить мотивацию:",
-        reply_markup=reply_markup
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
+async def _forward_random(chat_id, bot):
+    """Форвардит случайный пост, удаляя битые ID."""
+    for _ in range(5):  # максимум 5 попыток
+        message_id = get_random_message_id()
+        if not message_id:
+            return None
+        try:
+            await bot.forward_message(chat_id=chat_id, from_chat_id=CHANNEL_ID, message_id=message_id)
+            return message_id
+        except Exception as e:
+            logger.warning(f"Message {message_id} not found, removing. Error: {e}")
+            delete_message_id(message_id)
+    return None
+
+
 async def send_random_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message_id = get_random_message_id()
-    if message_id:
-        await context.bot.forward_message(chat_id=update.effective_chat.id,
-                                          from_chat_id=CHANNEL_ID,
-                                          message_id=message_id)
-    else:
+    result = await _forward_random(update.effective_chat.id, context.bot)
+    if result is None:
         await update.message.reply_text("Нет сохранённых постов.")
 
 
@@ -74,16 +89,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "get_random":
-        message_id = get_random_message_id()
-        if message_id:
-            await context.bot.forward_message(chat_id=query.message.chat.id,
-                                              from_chat_id=CHANNEL_ID,
-                                              message_id=message_id)
-        else:
+        result = await _forward_random(query.message.chat.id, context.bot)
+        if result is None:
             await query.edit_message_text("Нет сохранённых постов.")
 
 
-# --- Main ---
 def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
@@ -94,7 +104,7 @@ def main():
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, handle_channel_post))
 
     logger.info("Bot started")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
