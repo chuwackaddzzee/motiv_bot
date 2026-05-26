@@ -1,6 +1,6 @@
 import logging
 import os
-import psycopg2
+import asyncpg
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, filters, CommandHandler, ContextTypes, CallbackQueryHandler
 
@@ -11,48 +11,45 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-def get_conn():
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+db_pool = None
 
 
-def init_db():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY)''')
-    conn.commit()
-    conn.close()
+async def get_pool():
+    global db_pool
+    if db_pool is None:
+        db_pool = await asyncpg.create_pool(DATABASE_URL, ssl="require")
+    return db_pool
 
 
-def save_message_id(message_id: int):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("INSERT INTO messages (id) VALUES (%s) ON CONFLICT DO NOTHING", (message_id,))
-    conn.commit()
-    conn.close()
+async def init_db():
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY)")
 
 
-def get_random_message_id() -> int | None:
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT id FROM messages ORDER BY RANDOM() LIMIT 1")
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else None
+async def save_message_id(message_id: int):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("INSERT INTO messages (id) VALUES ($1) ON CONFLICT DO NOTHING", message_id)
 
 
-def delete_message_id(message_id: int):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM messages WHERE id = %s", (message_id,))
-    conn.commit()
-    conn.close()
+async def get_random_message_id():
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT id FROM messages ORDER BY RANDOM() LIMIT 1")
+        return row["id"] if row else None
+
+
+async def delete_message_id(message_id: int):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM messages WHERE id = $1", message_id)
 
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.channel_post
     if message and str(message.chat.id) == CHANNEL_ID:
-        save_message_id(message.message_id)
+        await save_message_id(message.message_id)
         logger.info(f"Saved message_id: {message.message_id}")
 
 
@@ -65,9 +62,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _forward_random(chat_id, bot):
-    """Форвардит случайный пост, удаляя битые ID."""
-    for _ in range(5):  # максимум 5 попыток
-        message_id = get_random_message_id()
+    for _ in range(5):
+        message_id = await get_random_message_id()
         if not message_id:
             return None
         try:
@@ -75,7 +71,7 @@ async def _forward_random(chat_id, bot):
             return message_id
         except Exception as e:
             logger.warning(f"Message {message_id} not found, removing. Error: {e}")
-            delete_message_id(message_id)
+            await delete_message_id(message_id)
     return None
 
 
@@ -94,9 +90,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Нет сохранённых постов.")
 
 
+async def post_init(application):
+    await init_db()
+
+
 def main():
-    init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("random", send_random_post))
